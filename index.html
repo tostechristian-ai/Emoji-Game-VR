@@ -1,6 +1,21 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
+  <style>
+  body { margin:0; overflow:hidden; background:#111; color:#fff; }
+
+  /* THIS FIXES THE ISSUE — UI goes above the canvas */
+  canvas {
+    position: relative;
+    z-index: 1;
+  }
+  #modeMenu, #upgradeMenuVR {
+    z-index: 10;
+    pointer-events: auto;
+  }
+  </style>
+  
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Emoji Survivor VR - Modular</title>
