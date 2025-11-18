@@ -1,0 +1,872 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Emoji Survivor VR</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; color: white; font-family: sans-serif; }
+        #info {
+            position: absolute; top: 10px; width: 100%; text-align: center; z-index: 100; pointer-events: none;
+        }
+    </style>
+    <!-- Import Maps Polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="info">
+        <h1>Emoji Survivor VR</h1>
+        <p>Put on headset & Click "ENTER VR"</p>
+        <p>Left Stick: Move | Auto-Fire Active</p>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { VRButton } from 'three/addons/webxr/VRButton.js';
+        import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+        import { TextGeometry } from 'three/addons/geometries/TextGeometry.js';
+        import { FontLoader } from 'three/addons/loaders/FontLoader.js';
+
+        // ==========================================================================
+        // 1. SETUP SCENE & CAMERA
+        // ==========================================================================
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x201030); // Dark purple fog like vampire survivors
+        scene.fog = new THREE.Fog(0x201030, 0, 60);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        
+        // The "User" container handles movement relative to the floor
+        const userGroup = new THREE.Group();
+        userGroup.position.set(0, 0, 0);
+        userGroup.add(camera);
+        scene.add(userGroup);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.xr.enabled = true;
+        document.body.appendChild(renderer.domElement);
+        document.body.appendChild(VRButton.createButton(renderer));
+
+        // Lighting
+        const light = new THREE.HemisphereLight(0xffffff, 0x444444, 3);
+        scene.add(light);
+
+        // Floor
+        const floorGeometry = new THREE.PlaneGeometry(200, 200);
+        const floorMaterial = new THREE.MeshStandardMaterial({ 
+            color: 0x1a1a1a, 
+            roughness: 0.8 
+        });
+        const floor = new THREE.Mesh(floorGeometry, floorMaterial);
+        floor.rotation.x = -Math.PI / 2;
+        scene.add(floor);
+
+        // Grid helper to see movement
+        const grid = new THREE.GridHelper(200, 50, 0x555555, 0x222222);
+        scene.add(grid);
+
+        // ==========================================================================
+        // 2. CONTROLLERS & MOVEMENT LOGIC
+        // ==========================================================================
+        const controller1 = renderer.xr.getController(0);
+        const controller2 = renderer.xr.getController(1);
+        userGroup.add(controller1);
+        userGroup.add(controller2);
+
+        const controllerModelFactory = new XRControllerModelFactory();
+        const controllerGrip1 = renderer.xr.getControllerGrip(0);
+        controllerGrip1.add(controllerModelFactory.createControllerModel(controllerGrip1));
+        userGroup.add(controllerGrip1);
+
+        const controllerGrip2 = renderer.xr.getControllerGrip(1);
+        controllerGrip2.add(controllerModelFactory.createControllerModel(controllerGrip2));
+        userGroup.add(controllerGrip2);
+
+        // Floating HUD attached to left controller
+        const hudCanvas = document.createElement('canvas');
+        hudCanvas.width = 512;
+        hudCanvas.height = 256;
+        const hudCtx = hudCanvas.getContext('2d');
+        const hudTexture = new THREE.CanvasTexture(hudCanvas);
+        const hudMaterial = new THREE.MeshBasicMaterial({ map: hudTexture, transparent: true });
+        const hudPlane = new THREE.Mesh(new THREE.PlaneGeometry(0.4, 0.2), hudMaterial);
+        hudPlane.position.set(0, 0.1, -0.1); // Floating above controller
+        hudPlane.rotation.x = -Math.PI / 4;
+        controllerGrip1.add(hudPlane); // Add to Left Hand
+
+        // ==========================================================================
+        // 3. GAME STATE & ASSET GENERATION (CANVAS TEXTURES)
+        // ==========================================================================
+        const gameState = {
+            score: 0,
+            level: 1,
+            xp: 0,
+            xpToNext: 10,
+            hp: 3,
+            maxHp: 3,
+            isGameOver: false,
+            lastFireTime: 0,
+            fireRate: 500, // ms
+            moveSpeed: 0.05,
+            enemySpawnRate: 1000,
+            lastEnemySpawn: 0,
+            enemiesKilled: 0
+        };
+
+        const entities = {
+            enemies: [],
+            bullets: [],
+            pickups: [],
+            damageText: []
+        };
+
+        // Helper to create Emoji Textures
+        function createEmojiTexture(emoji, size = 64) {
+            const canvas = document.createElement('canvas');
+            canvas.width = size;
+            canvas.height = size;
+            const ctx = canvas.getContext('2d');
+            ctx.font = `${size * 0.8}px sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(emoji, size / 2, size / 2);
+            const tex = new THREE.CanvasTexture(canvas);
+            return new THREE.SpriteMaterial({ map: tex });
+        }
+
+        // Pre-generate materials
+        const matZombie = createEmojiTexture('🧟');
+        const matBat = createEmojiTexture('🦇');
+        const matGhost = createEmojiTexture('👻');
+        const matBoss = createEmojiTexture('👹');
+        const matBullet = createEmojiTexture('🦴'); // Bones like the skeleton class
+        const matGem = createEmojiTexture('💎');
+        const matHeart = createEmojiTexture('❤️');
+
+        // ==========================================================================
+        // 4. GAMEPLAY FUNCTIONS
+        // ==========================================================================
+
+        function spawnEnemy() {
+            if (entities.enemies.length > 100) return; // Cap entities for performance on headset
+
+            const angle = Math.random() * Math.PI * 2;
+            const distance = 20 + Math.random() * 10; // Spawn radius
+            const x = userGroup.position.x + Math.cos(angle) * distance;
+            const z = userGroup.position.z + Math.sin(angle) * distance;
+
+            let type = 'zombie';
+            let material = matZombie;
+            let speed = 0.02 + (gameState.level * 0.002);
+            let hp = 1 + Math.floor(gameState.level * 0.5);
+
+            // Simple spawn logic based on level
+            const rand = Math.random();
+            if (gameState.level > 3 && rand < 0.3) { type = 'bat'; material = matBat; speed *= 1.5; }
+            if (gameState.level > 5 && rand < 0.1) { type = 'ghost'; material = matGhost; hp *= 2; }
+            if (gameState.level > 10 && rand < 0.05) { type = 'boss'; material = matBoss; hp *= 10; speed *= 0.8; }
+
+            const sprite = new THREE.Sprite(material);
+            sprite.scale.set(1.5, 1.5, 1.5); // Size of emoji
+            sprite.position.set(x, 1, z); // Floating slightly above ground
+
+            entities.enemies.push({
+                mesh: sprite,
+                hp: hp,
+                speed: speed,
+                type: type
+            });
+            scene.add(sprite);
+        }
+
+        function fireBullet() {
+            // Find closest enemy to aim at
+            let closestDist = Infinity;
+            let target = null;
+            
+            entities.enemies.forEach(enemy => {
+                const dist = userGroup.position.distanceTo(enemy.mesh.position);
+                if (dist < closestDist && dist < 20) { // Range
+                    closestDist = dist;
+                    target = enemy;
+                }
+            });
+
+            let direction = new THREE.Vector3(0, 0, -1); // Default forward
+            if (target) {
+                direction.subVectors(target.mesh.position, userGroup.position).normalize();
+            } else {
+                // If no target, shoot where camera is looking
+                camera.getWorldDirection(direction);
+            }
+
+            const bullet = new THREE.Sprite(matBullet);
+            bullet.scale.set(0.5, 0.5, 0.5);
+            bullet.position.copy(userGroup.position);
+            bullet.position.y = 1.2; // Shoot from chest height
+            
+            scene.add(bullet);
+            entities.bullets.push({
+                mesh: bullet,
+                velocity: direction.multiplyScalar(0.3), // Bullet speed
+                life: 100 // frames
+            });
+            
+            // Simple "Pew" sound using Web Audio API (Tone.js is heavy for this simple example)
+            playSimpleSound(400, 'sawtooth', 0.1);
+        }
+
+        function spawnPickup(x, z) {
+            const isHeart = Math.random() < 0.05;
+            const sprite = new THREE.Sprite(isHeart ? matHeart : matGem);
+            sprite.position.set(x, 0.5, z);
+            sprite.scale.set(0.8, 0.8, 0.8);
+            scene.add(sprite);
+            entities.pickups.push({
+                mesh: sprite,
+                type: isHeart ? 'heart' : 'xp',
+                value: isHeart ? 1 : 5
+            });
+        }
+
+        function updateHUD() {
+            hudCtx.clearRect(0, 0, hudCanvas.width, hudCanvas.height);
+            
+            // Background
+            hudCtx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+            hudCtx.fillRect(0, 0, hudCanvas.width, hudCanvas.height);
+            
+            // Border
+            hudCtx.strokeStyle = '#fff';
+            hudCtx.lineWidth = 4;
+            hudCtx.strokeRect(0,0, hudCanvas.width, hudCanvas.height);
+
+            // Text
+            hudCtx.fillStyle = '#fff';
+            hudCtx.font = '30px Arial';
+            hudCtx.fillText(`Health: ${"❤️".repeat(gameState.hp)}`, 20, 50);
+            hudCtx.fillText(`Lvl: ${gameState.level} | XP: ${gameState.xp}/${gameState.xpToNext}`, 20, 100);
+            hudCtx.fillText(`Kills: ${gameState.enemiesKilled}`, 20, 150);
+            
+            if (gameState.isGameOver) {
+                hudCtx.fillStyle = '#ff0000';
+                hudCtx.font = 'bold 50px Arial';
+                hudCtx.fillText("GAME OVER", 100, 200);
+            }
+
+            hudTexture.needsUpdate = true;
+        }
+
+        function playSimpleSound(freq, type, duration) {
+            // Basic audio context fallback
+            if (!window.audioCtx) window.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const osc = window.audioCtx.createOscillator();
+            const gain = window.audioCtx.createGain();
+            osc.type = type;
+            osc.frequency.setValueAtTime(freq, window.audioCtx.currentTime);
+            gain.gain.setValueAtTime(0.1, window.audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, window.audioCtx.currentTime + duration);
+            osc.connect(gain);
+            gain.connect(window.audioCtx.destination);
+            osc.start();
+            osc.stop(window.audioCtx.currentTime + duration);
+        }
+
+        // ==========================================================================
+        // 5. MAIN LOOP
+        // ==========================================================================
+        
+        renderer.setAnimationLoop(function () {
+            if (gameState.isGameOver) {
+                // Spin camera gently on death or simple stop
+                renderer.render(scene, camera);
+                return;
+            }
+
+            const now = performance.now();
+
+            // --- 1. Handle VR Controller Input (Movement) ---
+            const session = renderer.xr.getSession();
+            if (session && session.inputSources) {
+                for (const source of session.inputSources) {
+                    if (source.gamepad) {
+                        const gp = source.gamepad;
+                        // Standard mapping: axes[2] is X, axes[3] is Y for thumbstick
+                        // Note: Mapping varies by browser/headset. Usually 2/3 on Quest.
+                        if (gp.axes.length >= 4) {
+                            const x = gp.axes[2]; 
+                            const y = gp.axes[3];
+                            
+                            // Deadzone
+                            if (Math.abs(x) > 0.1 || Math.abs(y) > 0.1) {
+                                // Move relative to camera direction
+                                const angle = camera.rotation.y; // Yaw
+                                const dx = x * Math.cos(angle) + y * Math.sin(angle);
+                                const dz = -x * Math.sin(angle) + y * Math.cos(angle); // Inverted for intuitive movement
+                                
+                                userGroup.position.x += dx * gameState.moveSpeed;
+                                userGroup.position.z += dz * gameState.moveSpeed;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // --- 2. Spawning ---
+            if (now - gameState.lastEnemySpawn > gameState.enemySpawnRate) {
+                spawnEnemy();
+                gameState.lastEnemySpawn = now;
+            }
+
+            // --- 3. Auto Fire ---
+            if (now - gameState.lastFireTime > gameState.fireRate) {
+                fireBullet();
+                gameState.lastFireTime = now;
+            }
+
+            // --- 4. Updates (Enemies, Bullets) ---
+            
+            // Bullets
+            for (let i = entities.bullets.length - 1; i >= 0; i--) {
+                const b = entities.bullets[i];
+                b.mesh.position.add(b.velocity);
+                b.life--;
+                if (b.life <= 0) {
+                    scene.remove(b.mesh);
+                    entities.bullets.splice(i, 1);
+                }
+            }
+
+            // Enemies
+            for (let i = entities.enemies.length - 1; i >= 0; i--) {
+                const e = entities.enemies[i];
+                
+                // Chase Player
+                const dir = new THREE.Vector3();
+                dir.subVectors(userGroup.position, e.mesh.position).normalize();
+                e.mesh.position.add(dir.multiplyScalar(e.speed));
+                
+                // Collision: Enemy touches Player
+                if (e.mesh.position.distanceTo(userGroup.position) < 1.0) {
+                    gameState.hp--;
+                    updateHUD();
+                    playSimpleSound(100, 'square', 0.3);
+                    
+                    // Knockback
+                    e.mesh.position.sub(dir.multiplyScalar(5.0));
+
+                    if (gameState.hp <= 0) {
+                        gameState.isGameOver = true;
+                        updateHUD();
+                    }
+                }
+
+                // Collision: Bullet hits Enemy
+                for (let j = entities.bullets.length - 1; j >= 0; j--) {
+                    const b = entities.bullets[j];
+                    if (b.mesh.position.distanceTo(e.mesh.position) < 1.5) {
+                        e.hp--;
+                        scene.remove(b.mesh);
+                        entities.bullets.splice(j, 1); // Remove bullet
+
+                        // Enemy Death
+                        if (e.hp <= 0) {
+                            spawnPickup(e.mesh.position.x, e.mesh.position.z);
+                            scene.remove(e.mesh);
+                            entities.enemies.splice(i, 1);
+                            gameState.enemiesKilled++;
+                            playSimpleSound(600, 'sine', 0.1);
+                            updateHUD();
+                        }
+                        break; // Bullet hit only one enemy
+                    }
+                }
+            }
+
+            // Pickups
+            for (let i = entities.pickups.length - 1; i >= 0; i--) {
+                const p = entities.pickups[i];
+                // Magnet effect
+                const dist = p.mesh.position.distanceTo(userGroup.position);
+                if (dist < 5) {
+                    p.mesh.position.lerp(userGroup.position, 0.1);
+                }
+                if (dist < 1) {
+                    if (p.type === 'xp') {
+                        gameState.xp += p.value;
+                        if (gameState.xp >= gameState.xpToNext) {
+                            gameState.level++;
+                            gameState.xp = 0;
+                            gameState.xpToNext = Math.floor(gameState.xpToNext * 1.5);
+                            gameState.fireRate = Math.max(100, gameState.fireRate * 0.9); // Upgrade fire rate
+                            playSimpleSound(800, 'triangle', 0.5);
+                        }
+                    } else {
+                        gameState.hp = Math.min(gameState.maxHp, gameState.hp + 1);
+                    }
+                    scene.remove(p.mesh);
+                    entities.pickups.splice(i, 1);
+                    updateHUD();
+                }
+            }
+            
+            // Keep HUD Updated visually (optional, can optimize to only call on change)
+            // updateHUD(); 
+
+            renderer.render(scene, camera);
+        });
+
+        // Initial HUD draw
+        updateHUD();
+
+    </script>
+</body>
+</html>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Emoji Survivor VR</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; color: white; font-family: sans-serif; }
+        #info {
+            position: absolute; top: 10px; width: 100%; text-align: center; z-index: 100; pointer-events: none;
+        }
+    </style>
+    <!-- Import Maps Polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="info">
+        <h1>Emoji Survivor VR</h1>
+        <p>Put on headset & Click "ENTER VR"</p>
+        <p>Left Stick: Move | Auto-Fire Active</p>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { VRButton } from 'three/addons/webxr/VRButton.js';
+        import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+        import { TextGeometry } from 'three/addons/geometries/TextGeometry.js';
+        import { FontLoader } from 'three/addons/loaders/FontLoader.js';
+
+        // ==========================================================================
+        // 1. SETUP SCENE & CAMERA
+        // ==========================================================================
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x201030); // Dark purple fog like vampire survivors
+        scene.fog = new THREE.Fog(0x201030, 0, 60);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        
+        // The "User" container handles movement relative to the floor
+        const userGroup = new THREE.Group();
+        userGroup.position.set(0, 0, 0);
+        userGroup.add(camera);
+        scene.add(userGroup);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.xr.enabled = true;
+        document.body.appendChild(renderer.domElement);
+        document.body.appendChild(VRButton.createButton(renderer));
+
+        // Lighting
+        const light = new THREE.HemisphereLight(0xffffff, 0x444444, 3);
+        scene.add(light);
+
+        // Floor
+        const floorGeometry = new THREE.PlaneGeometry(200, 200);
+        const floorMaterial = new THREE.MeshStandardMaterial({ 
+            color: 0x1a1a1a, 
+            roughness: 0.8 
+        });
+        const floor = new THREE.Mesh(floorGeometry, floorMaterial);
+        floor.rotation.x = -Math.PI / 2;
+        scene.add(floor);
+
+        // Grid helper to see movement
+        const grid = new THREE.GridHelper(200, 50, 0x555555, 0x222222);
+        scene.add(grid);
+
+        // ==========================================================================
+        // 2. CONTROLLERS & MOVEMENT LOGIC
+        // ==========================================================================
+        const controller1 = renderer.xr.getController(0);
+        const controller2 = renderer.xr.getController(1);
+        userGroup.add(controller1);
+        userGroup.add(controller2);
+
+        const controllerModelFactory = new XRControllerModelFactory();
+        const controllerGrip1 = renderer.xr.getControllerGrip(0);
+        controllerGrip1.add(controllerModelFactory.createControllerModel(controllerGrip1));
+        userGroup.add(controllerGrip1);
+
+        const controllerGrip2 = renderer.xr.getControllerGrip(1);
+        controllerGrip2.add(controllerModelFactory.createControllerModel(controllerGrip2));
+        userGroup.add(controllerGrip2);
+
+        // Floating HUD attached to left controller
+        const hudCanvas = document.createElement('canvas');
+        hudCanvas.width = 512;
+        hudCanvas.height = 256;
+        const hudCtx = hudCanvas.getContext('2d');
+        const hudTexture = new THREE.CanvasTexture(hudCanvas);
+        const hudMaterial = new THREE.MeshBasicMaterial({ map: hudTexture, transparent: true });
+        const hudPlane = new THREE.Mesh(new THREE.PlaneGeometry(0.4, 0.2), hudMaterial);
+        hudPlane.position.set(0, 0.1, -0.1); // Floating above controller
+        hudPlane.rotation.x = -Math.PI / 4;
+        controllerGrip1.add(hudPlane); // Add to Left Hand
+
+        // ==========================================================================
+        // 3. GAME STATE & ASSET GENERATION (CANVAS TEXTURES)
+        // ==========================================================================
+        const gameState = {
+            score: 0,
+            level: 1,
+            xp: 0,
+            xpToNext: 10,
+            hp: 3,
+            maxHp: 3,
+            isGameOver: false,
+            lastFireTime: 0,
+            fireRate: 500, // ms
+            moveSpeed: 0.05,
+            enemySpawnRate: 1000,
+            lastEnemySpawn: 0,
+            enemiesKilled: 0
+        };
+
+        const entities = {
+            enemies: [],
+            bullets: [],
+            pickups: [],
+            damageText: []
+        };
+
+        // Helper to create Emoji Textures
+        function createEmojiTexture(emoji, size = 64) {
+            const canvas = document.createElement('canvas');
+            canvas.width = size;
+            canvas.height = size;
+            const ctx = canvas.getContext('2d');
+            ctx.font = `${size * 0.8}px sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(emoji, size / 2, size / 2);
+            const tex = new THREE.CanvasTexture(canvas);
+            return new THREE.SpriteMaterial({ map: tex });
+        }
+
+        // Pre-generate materials
+        const matZombie = createEmojiTexture('🧟');
+        const matBat = createEmojiTexture('🦇');
+        const matGhost = createEmojiTexture('👻');
+        const matBoss = createEmojiTexture('👹');
+        const matBullet = createEmojiTexture('🦴'); // Bones like the skeleton class
+        const matGem = createEmojiTexture('💎');
+        const matHeart = createEmojiTexture('❤️');
+
+        // ==========================================================================
+        // 4. GAMEPLAY FUNCTIONS
+        // ==========================================================================
+
+        function spawnEnemy() {
+            if (entities.enemies.length > 100) return; // Cap entities for performance on headset
+
+            const angle = Math.random() * Math.PI * 2;
+            const distance = 20 + Math.random() * 10; // Spawn radius
+            const x = userGroup.position.x + Math.cos(angle) * distance;
+            const z = userGroup.position.z + Math.sin(angle) * distance;
+
+            let type = 'zombie';
+            let material = matZombie;
+            let speed = 0.02 + (gameState.level * 0.002);
+            let hp = 1 + Math.floor(gameState.level * 0.5);
+
+            // Simple spawn logic based on level
+            const rand = Math.random();
+            if (gameState.level > 3 && rand < 0.3) { type = 'bat'; material = matBat; speed *= 1.5; }
+            if (gameState.level > 5 && rand < 0.1) { type = 'ghost'; material = matGhost; hp *= 2; }
+            if (gameState.level > 10 && rand < 0.05) { type = 'boss'; material = matBoss; hp *= 10; speed *= 0.8; }
+
+            const sprite = new THREE.Sprite(material);
+            sprite.scale.set(1.5, 1.5, 1.5); // Size of emoji
+            sprite.position.set(x, 1, z); // Floating slightly above ground
+
+            entities.enemies.push({
+                mesh: sprite,
+                hp: hp,
+                speed: speed,
+                type: type
+            });
+            scene.add(sprite);
+        }
+
+        function fireBullet() {
+            // Find closest enemy to aim at
+            let closestDist = Infinity;
+            let target = null;
+            
+            entities.enemies.forEach(enemy => {
+                const dist = userGroup.position.distanceTo(enemy.mesh.position);
+                if (dist < closestDist && dist < 20) { // Range
+                    closestDist = dist;
+                    target = enemy;
+                }
+            });
+
+            let direction = new THREE.Vector3(0, 0, -1); // Default forward
+            if (target) {
+                direction.subVectors(target.mesh.position, userGroup.position).normalize();
+            } else {
+                // If no target, shoot where camera is looking
+                camera.getWorldDirection(direction);
+            }
+
+            const bullet = new THREE.Sprite(matBullet);
+            bullet.scale.set(0.5, 0.5, 0.5);
+            bullet.position.copy(userGroup.position);
+            bullet.position.y = 1.2; // Shoot from chest height
+            
+            scene.add(bullet);
+            entities.bullets.push({
+                mesh: bullet,
+                velocity: direction.multiplyScalar(0.3), // Bullet speed
+                life: 100 // frames
+            });
+            
+            // Simple "Pew" sound using Web Audio API (Tone.js is heavy for this simple example)
+            playSimpleSound(400, 'sawtooth', 0.1);
+        }
+
+        function spawnPickup(x, z) {
+            const isHeart = Math.random() < 0.05;
+            const sprite = new THREE.Sprite(isHeart ? matHeart : matGem);
+            sprite.position.set(x, 0.5, z);
+            sprite.scale.set(0.8, 0.8, 0.8);
+            scene.add(sprite);
+            entities.pickups.push({
+                mesh: sprite,
+                type: isHeart ? 'heart' : 'xp',
+                value: isHeart ? 1 : 5
+            });
+        }
+
+        function updateHUD() {
+            hudCtx.clearRect(0, 0, hudCanvas.width, hudCanvas.height);
+            
+            // Background
+            hudCtx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+            hudCtx.fillRect(0, 0, hudCanvas.width, hudCanvas.height);
+            
+            // Border
+            hudCtx.strokeStyle = '#fff';
+            hudCtx.lineWidth = 4;
+            hudCtx.strokeRect(0,0, hudCanvas.width, hudCanvas.height);
+
+            // Text
+            hudCtx.fillStyle = '#fff';
+            hudCtx.font = '30px Arial';
+            hudCtx.fillText(`Health: ${"❤️".repeat(gameState.hp)}`, 20, 50);
+            hudCtx.fillText(`Lvl: ${gameState.level} | XP: ${gameState.xp}/${gameState.xpToNext}`, 20, 100);
+            hudCtx.fillText(`Kills: ${gameState.enemiesKilled}`, 20, 150);
+            
+            if (gameState.isGameOver) {
+                hudCtx.fillStyle = '#ff0000';
+                hudCtx.font = 'bold 50px Arial';
+                hudCtx.fillText("GAME OVER", 100, 200);
+            }
+
+            hudTexture.needsUpdate = true;
+        }
+
+        function playSimpleSound(freq, type, duration) {
+            // Basic audio context fallback
+            if (!window.audioCtx) window.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const osc = window.audioCtx.createOscillator();
+            const gain = window.audioCtx.createGain();
+            osc.type = type;
+            osc.frequency.setValueAtTime(freq, window.audioCtx.currentTime);
+            gain.gain.setValueAtTime(0.1, window.audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, window.audioCtx.currentTime + duration);
+            osc.connect(gain);
+            gain.connect(window.audioCtx.destination);
+            osc.start();
+            osc.stop(window.audioCtx.currentTime + duration);
+        }
+
+        // ==========================================================================
+        // 5. MAIN LOOP
+        // ==========================================================================
+        
+        renderer.setAnimationLoop(function () {
+            if (gameState.isGameOver) {
+                // Spin camera gently on death or simple stop
+                renderer.render(scene, camera);
+                return;
+            }
+
+            const now = performance.now();
+
+            // --- 1. Handle VR Controller Input (Movement) ---
+            const session = renderer.xr.getSession();
+            if (session && session.inputSources) {
+                for (const source of session.inputSources) {
+                    if (source.gamepad) {
+                        const gp = source.gamepad;
+                        // Standard mapping: axes[2] is X, axes[3] is Y for thumbstick
+                        // Note: Mapping varies by browser/headset. Usually 2/3 on Quest.
+                        if (gp.axes.length >= 4) {
+                            const x = gp.axes[2]; 
+                            const y = gp.axes[3];
+                            
+                            // Deadzone
+                            if (Math.abs(x) > 0.1 || Math.abs(y) > 0.1) {
+                                // Move relative to camera direction
+                                const angle = camera.rotation.y; // Yaw
+                                const dx = x * Math.cos(angle) + y * Math.sin(angle);
+                                const dz = -x * Math.sin(angle) + y * Math.cos(angle); // Inverted for intuitive movement
+                                
+                                userGroup.position.x += dx * gameState.moveSpeed;
+                                userGroup.position.z += dz * gameState.moveSpeed;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // --- 2. Spawning ---
+            if (now - gameState.lastEnemySpawn > gameState.enemySpawnRate) {
+                spawnEnemy();
+                gameState.lastEnemySpawn = now;
+            }
+
+            // --- 3. Auto Fire ---
+            if (now - gameState.lastFireTime > gameState.fireRate) {
+                fireBullet();
+                gameState.lastFireTime = now;
+            }
+
+            // --- 4. Updates (Enemies, Bullets) ---
+            
+            // Bullets
+            for (let i = entities.bullets.length - 1; i >= 0; i--) {
+                const b = entities.bullets[i];
+                b.mesh.position.add(b.velocity);
+                b.life--;
+                if (b.life <= 0) {
+                    scene.remove(b.mesh);
+                    entities.bullets.splice(i, 1);
+                }
+            }
+
+            // Enemies
+            for (let i = entities.enemies.length - 1; i >= 0; i--) {
+                const e = entities.enemies[i];
+                
+                // Chase Player
+                const dir = new THREE.Vector3();
+                dir.subVectors(userGroup.position, e.mesh.position).normalize();
+                e.mesh.position.add(dir.multiplyScalar(e.speed));
+                
+                // Collision: Enemy touches Player
+                if (e.mesh.position.distanceTo(userGroup.position) < 1.0) {
+                    gameState.hp--;
+                    updateHUD();
+                    playSimpleSound(100, 'square', 0.3);
+                    
+                    // Knockback
+                    e.mesh.position.sub(dir.multiplyScalar(5.0));
+
+                    if (gameState.hp <= 0) {
+                        gameState.isGameOver = true;
+                        updateHUD();
+                    }
+                }
+
+                // Collision: Bullet hits Enemy
+                for (let j = entities.bullets.length - 1; j >= 0; j--) {
+                    const b = entities.bullets[j];
+                    if (b.mesh.position.distanceTo(e.mesh.position) < 1.5) {
+                        e.hp--;
+                        scene.remove(b.mesh);
+                        entities.bullets.splice(j, 1); // Remove bullet
+
+                        // Enemy Death
+                        if (e.hp <= 0) {
+                            spawnPickup(e.mesh.position.x, e.mesh.position.z);
+                            scene.remove(e.mesh);
+                            entities.enemies.splice(i, 1);
+                            gameState.enemiesKilled++;
+                            playSimpleSound(600, 'sine', 0.1);
+                            updateHUD();
+                        }
+                        break; // Bullet hit only one enemy
+                    }
+                }
+            }
+
+            // Pickups
+            for (let i = entities.pickups.length - 1; i >= 0; i--) {
+                const p = entities.pickups[i];
+                // Magnet effect
+                const dist = p.mesh.position.distanceTo(userGroup.position);
+                if (dist < 5) {
+                    p.mesh.position.lerp(userGroup.position, 0.1);
+                }
+                if (dist < 1) {
+                    if (p.type === 'xp') {
+                        gameState.xp += p.value;
+                        if (gameState.xp >= gameState.xpToNext) {
+                            gameState.level++;
+                            gameState.xp = 0;
+                            gameState.xpToNext = Math.floor(gameState.xpToNext * 1.5);
+                            gameState.fireRate = Math.max(100, gameState.fireRate * 0.9); // Upgrade fire rate
+                            playSimpleSound(800, 'triangle', 0.5);
+                        }
+                    } else {
+                        gameState.hp = Math.min(gameState.maxHp, gameState.hp + 1);
+                    }
+                    scene.remove(p.mesh);
+                    entities.pickups.splice(i, 1);
+                    updateHUD();
+                }
+            }
+            
+            // Keep HUD Updated visually (optional, can optimize to only call on change)
+            // updateHUD(); 
+
+            renderer.render(scene, camera);
+        });
+
+        // Initial HUD draw
+        updateHUD();
+
+    </script>
+</body>
+</html>
+
